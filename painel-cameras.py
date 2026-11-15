@@ -2,7 +2,8 @@
 """Painel de câmeras no HDMI: rodízio de snapshots RTSP desenhado no framebuffer.
 
 - Uma thread captura 1 quadro por câmera (ffmpeg) e grava em /run/painel
-  (RAM, não desgasta o cartão SD).
+  (RAM, não desgasta o cartão SD). Cada captura gera o quadro reduzido
+  para a tela e o quadro em resolução original, que é o que vai para o disco.
 - O laço principal desenha, 1x por segundo, a câmera da vez + barra com nome,
   relógio e "atualizado há Ns" direto em /dev/fb0 (sem desktop, sem navegador).
 - Opcionalmente grava cada snapshot em disco, com retenção por idade e por tamanho.
@@ -142,12 +143,18 @@ def capturar(cam, usuario, senha, larg, alt):
     )
     destino = f"{PASTA}/{cam['id']}.jpg"
     tmp = f"{PASTA}/{cam['id']}.tmp.jpg"
+    destino_full = f"{PASTA}/{cam['id']}.full.jpg"
+    tmp_full = f"{PASTA}/{cam['id']}.full.tmp.jpg"
+    # Uma única captura, duas saídas: o quadro original (para gravar em disco)
+    # e o reduzido para a tela (TV).
     cmd = [
         "ffmpeg", "-y", "-v", "error",
         "-rtsp_transport", cam["transporte"], "-timeout", "15000000",
-        "-i", url, "-frames:v", "1",
-        "-vf", f"scale={larg}:{alt}:force_original_aspect_ratio=decrease",
-        "-q:v", "4", tmp,
+        "-i", url,
+        "-map", "0:v:0", "-frames:v", "1", "-q:v", "1", tmp_full,
+        "-map", "0:v:0", "-frames:v", "1",
+        "-vf", f"scale={larg}:{alt}:force_original_aspect_ratio=decrease:flags=lanczos",
+        "-q:v", "2", tmp,
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
@@ -155,6 +162,7 @@ def capturar(cam, usuario, senha, larg, alt):
         return "tempo esgotado"
     if r.returncode != 0:
         return limpar(r.stderr, senha) or f"ffmpeg saiu com {r.returncode}"
+    os.replace(tmp_full, destino_full)
     os.replace(tmp, destino)
     return None
 
@@ -201,7 +209,10 @@ def gravar(cam):
         os.makedirs(pasta, exist_ok=True)
         destino = os.path.join(pasta, time.strftime("%H-%M-%S", agora) + ".jpg")
         tmp = destino + ".tmp"
-        shutil.copyfile(f"{PASTA}/{cam['id']}.jpg", tmp)
+        origem = f"{PASTA}/{cam['id']}.full.jpg"  # resolução original da câmera
+        if not os.path.exists(origem):
+            origem = f"{PASTA}/{cam['id']}.jpg"
+        shutil.copyfile(origem, tmp)
         os.replace(tmp, destino)
     except OSError as e:
         log(f"{cam['nome']}: não consegui gravar a foto ({e.strerror})")

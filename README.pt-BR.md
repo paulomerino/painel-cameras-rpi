@@ -24,6 +24,7 @@ framebuffer, e o `ffmpeg` para buscar os quadros.
 - **Barra** com nome da câmera, "atualizado há Ns" e relógio. Mostra **SEM SINAL** se a imagem ficar velha (60 s).
 - **Grava as fotos** em `/var/lib/painel/<câmera>/<AAAA-MM-DD>/<HH-MM-SS>.jpg`, com **retenção por idade**
   (padrão 7 dias) e **limite de tamanho** (padrão 8 GB, apaga as mais antigas primeiro).
+  As fotos são gravadas na **resolução original da câmera**; a TV recebe uma cópia reduzida da mesma captura.
 - Só grava com o **relógio sincronizado** (o Pi não tem relógio de bateria) e com mais de 2 GB livres.
 - A configuração é um único arquivo `/etc/painel-cameras.env` (modo 600), com as senhas fora do código.
 

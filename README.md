@@ -27,6 +27,7 @@ with `ffmpeg` fetching the frames.
 - **Top bar** with the camera name, "updated Ns ago" and a clock. Shows **NO SIGNAL** if the image gets stale (60 s).
 - **Saves the photos** to `/var/lib/painel/<camera>/<YYYY-MM-DD>/<HH-MM-SS>.jpg`, with **age-based retention**
   (default 7 days) and a **size cap** (default 8 GB, oldest photos deleted first).
+  Photos are saved at the **camera's original resolution**; the TV gets a downscaled copy from the same capture.
 - Only records when the **clock is NTP-synced** (the Pi has no battery-backed clock) and more than 2 GB is free.
 - A single config file, `/etc/painel-cameras.env` (mode 600), keeps passwords out of the code.
 
