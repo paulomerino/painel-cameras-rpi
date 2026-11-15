@@ -1,0 +1,15 @@
+[Unit]
+Description=Painel de câmeras no HDMI (rodízio de snapshots)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/bin/painel-cameras.py
+ExecStopPost=/usr/bin/vcgencmd display_power 1
+Restart=on-failure
+RestartSec=5
+# 78 = configuração inválida: reiniciar não adianta
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target

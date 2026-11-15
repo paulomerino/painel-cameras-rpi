@@ -1,0 +1,9 @@
+# Nunca versionar credenciais nem fotos das câmeras
+*.env
+!*.env.example
+*.jpg
+*.jpeg
+*.png
+
+__pycache__/
+*.pyc
