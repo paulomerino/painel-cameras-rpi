@@ -114,5 +114,93 @@ class TestLimpeza(unittest.TestCase):
         m.limpar_gravacoes()
 
 
+CAM = {"id": "CAM1", "nome": "Câmera 1", "host": "10.0.0.1", "porta": 554, "caminho": "/onvif1", "transporte": "udp"}
+
+
+class TestConexaoContinua(unittest.TestCase):
+    def test_padroes_de_gravacao(self):
+        m = carregar({"PAINEL_CONFIG": "/nao/existe"})
+        self.assertEqual((m.GRAVAR_INTERVALO, m.RETENCAO_DIAS, m.SO_CHAVES), (10, 5, True))
+
+    def test_url_escapa_usuario_e_senha(self):
+        m = carregar({"PAINEL_CONFIG": "/nao/existe"})
+        url = m.url_rtsp(CAM, "adm@in", "p#s/s:w")
+        self.assertEqual(url, "rtsp://adm%40in:p%23s%2Fs%3Aw@10.0.0.1:554/onvif1")
+
+    def test_comando_decodifica_so_quadros_chave_antes_da_entrada(self):
+        m = carregar({"PAINEL_CONFIG": "/nao/existe", "PAINEL_PAUSA": "10"})
+        cmd = m.comando_continuo(CAM, "u", "p", 1174, 624)
+        self.assertEqual(cmd[cmd.index("-skip_frame") + 1], "nokey")
+        self.assertLess(cmd.index("-skip_frame"), cmd.index("-i"))  # é opção de entrada
+        grafo = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("gte(t-prev_selected_t,10)", grafo)  # 1 quadro a cada PAUSA s
+        self.assertIn("scale=1174:624", grafo)
+        self.assertEqual(cmd.count("-atomic_writing"), 2)  # a tela nunca lê JPEG pela metade
+        self.assertEqual(cmd[-1], f"{m.PASTA}/CAM1.jpg")
+        saida_original = cmd[cmd.index("[f]") + 11]  # logo depois das opções do -map [f]
+        self.assertTrue(saida_original.endswith("CAM1.full.jpg"))
+
+    def test_quadros_chave_pode_ser_desligado(self):
+        m = carregar({"PAINEL_CONFIG": "/nao/existe", "PAINEL_SO_QUADROS_CHAVE": "0"})
+        self.assertNotIn("-skip_frame", m.comando_continuo(CAM, "u", "p", 1174, 624))
+
+
+class TestBarra(unittest.TestCase):
+    def test_barra_isolada_igual_ao_topo_do_quadro_completo(self):
+        from unittest import mock
+        from PIL import Image
+        m = carregar({"PAINEL_CONFIG": "/nao/existe"})
+        m.CAMERAS[:] = [CAM]
+        m.estado["CAM1"] = {"ok": 1.0, "erro": None, "falhas": 0}
+        larg, alt = 400, 300
+        fundo = Image.effect_noise((larg, alt), 80).convert("RGB")
+        topo = fundo.crop((0, 0, larg, m.BARRA))
+        base = Image.blend(topo, Image.new("RGB", topo.size, (0, 0, 0)), 0.6)
+        with mock.patch.object(m.time, "strftime", return_value="14/11  22:26:38"):
+            quadro = m.montar_quadro(CAM, 0, larg, alt, fundo, base, 5.0)
+            barra = m.desenhar_barra(CAM, 0, larg, base, 5.0)
+        self.assertEqual(quadro.crop((0, 0, larg, m.BARRA)).tobytes(), barra.tobytes())
+
+    def test_sem_sinal_nao_mexe_na_barra(self):
+        from unittest import mock
+        from PIL import Image
+        m = carregar({"PAINEL_CONFIG": "/nao/existe"})
+        m.CAMERAS[:] = [CAM]
+        m.estado["CAM1"] = {"ok": 1.0, "erro": None, "falhas": 0}
+        fundo = Image.new("RGB", (400, 300), (30, 60, 90))
+        base = Image.new("RGB", (400, m.BARRA), (0, 0, 0))
+        with mock.patch.object(m.time, "strftime", return_value="x"):
+            ok = m.montar_quadro(CAM, 0, 400, 300, fundo, base, 5.0)
+            velho = m.montar_quadro(CAM, 0, 400, 300, fundo, base, 5.0 + m.SEM_SINAL + 1)
+        self.assertNotEqual(ok.crop((0, 230, 400, 300)).tobytes(), velho.crop((0, 230, 400, 300)).tobytes())
+
+
+class TestGravacaoIntervalo(unittest.TestCase):
+    def test_respeita_o_intervalo_entre_fotos(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as pasta, tempfile.TemporaryDirectory() as grav:
+            m = carregar({"PAINEL_CONFIG": "/nao/existe", "PAINEL_GRAVAR_DIR": grav})
+            m.PASTA, m.MIN_LIVRE_GB = pasta, 0
+            criar(f"{pasta}/CAM1.full.jpg")
+            with mock.patch.object(m, "relogio_sincronizado", return_value=True), \
+                    mock.patch.object(m.shutil, "copyfile", wraps=m.shutil.copyfile) as cp:
+                m.gravar(CAM)
+                m.gravar(CAM)  # dentro do intervalo: não grava
+                self.assertEqual(cp.call_count, 1)
+                m._ultima_gravacao["CAM1"] -= m.GRAVAR_INTERVALO + 1  # intervalo vencido
+                m.gravar(CAM)
+                self.assertEqual(cp.call_count, 2)
+
+    def test_nao_grava_com_relogio_nao_sincronizado(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as pasta, tempfile.TemporaryDirectory() as grav:
+            m = carregar({"PAINEL_CONFIG": "/nao/existe", "PAINEL_GRAVAR_DIR": grav})
+            m.PASTA = pasta
+            criar(f"{pasta}/CAM1.full.jpg")
+            with mock.patch.object(m, "relogio_sincronizado", return_value=False):
+                m.gravar(CAM)
+            self.assertEqual(os.listdir(grav), [])
+
+
 if __name__ == "__main__":
     unittest.main()

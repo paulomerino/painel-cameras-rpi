@@ -23,16 +23,19 @@ with `ffmpeg` fetching the frames.
 
 ## What it does
 
-- **Rotating RTSP snapshots** across one or more cameras (a new image every ~8–15 s on a Pi 1).
+- **Rotating RTSP snapshots** across one or more cameras. A new image arrives about every ~12 s on a Pi 1 with
+  the test camera: the cadence follows the camera's keyframes (see "How it works").
 - **Top bar** with the camera name, "updated Ns ago" and a clock. Shows **NO SIGNAL** if the image gets stale (60 s).
-- **Saves the photos** to `/var/lib/painel/<camera>/<YYYY-MM-DD>/<HH-MM-SS>.jpg`, with **age-based retention**
-  (default 7 days) and a **size cap** (default 8 GB, oldest photos deleted first).
-  Photos are saved at the **camera's original resolution**; the TV gets a downscaled copy from the same capture.
+- **Saves the photos** to `/var/lib/painel/<camera>/<YYYY-MM-DD>/<HH-MM-SS>.jpg` (at most one every
+  `PAINEL_GRAVAR_INTERVALO`, default 10 s), with **age-based retention** (default 5 days) and a **size cap**
+  (default 8 GB, oldest photos deleted first).
+  Photos are saved at the **camera's original resolution**; the TV gets a downscaled copy from the same frame.
 - Only records when the **clock is NTP-synced** (the Pi has no battery-backed clock) and more than 2 GB is free.
 - A single config file, `/etc/painel-cameras.env` (mode 600), keeps passwords out of the code.
 
-> **This is not live video.** It is a still frame refreshed every few seconds. Continuous decoding is not
-> viable on a Pi 1 (a single snapshot takes ~8 s just to connect and decode).
+> **This is not live video.** It is a still frame refreshed every ~10 s or more. The panel keeps one `ffmpeg`
+> connected per camera and decodes **only the keyframes** (`-skip_frame nokey`). Decoding every frame was not
+> tried on a Pi 1; if you turn keyframe-only off (`PAINEL_SO_QUADROS_CHAVE=0`), expect much higher CPU.
 
 ## Requirements
 
@@ -69,10 +72,12 @@ One camera per prefix: `CAM1_`, `CAM2_`, …. The password is read literally (no
 | `CAMn_CAMINHO` | `/onvif1` | Stream path (varies by manufacturer) |
 | `CAMn_TRANSPORTE` | `udp` | `udp` or `tcp` (see "Technical notes") |
 | `PAINEL_ROTACAO` | `10` | Seconds each camera stays on screen |
-| `PAINEL_PAUSA` | `2` | Pause between captures |
+| `PAINEL_PAUSA` | `2` | Minimum seconds between the frames `ffmpeg` hands over (on a Pi 1, `10` is a good value; the real cadence follows the camera's keyframes) |
+| `PAINEL_SO_QUADROS_CHAVE` | `1` | `1` decodes only keyframes (light, needed on a Pi 1); `0` decodes every frame |
 | `PAINEL_GRAVAR` | `1` | `0` turns recording off |
 | `PAINEL_GRAVAR_DIR` | `/var/lib/painel` | Where photos are stored |
-| `PAINEL_RETENCAO_DIAS` | `7` | Delete photos older than this many days |
+| `PAINEL_GRAVAR_INTERVALO` | `10` | Minimum seconds between saved photos, per camera |
+| `PAINEL_RETENCAO_DIAS` | `5` | Delete photos older than this many days |
 | `PAINEL_LIMITE_GB` | `8` | Space cap; above it, the oldest photos are deleted |
 
 After editing the file: `sudo systemctl restart painel-cameras`.
@@ -80,40 +85,57 @@ After editing the file: `sudo systemctl restart painel-cameras`.
 ## How it works
 
 ```
- camera(s) ──RTSP/UDP──► ffmpeg (1 frame) ──► /run/painel/CAMn.jpg   (RAM, spares the SD card)
-                                                 │            │
-                                   draws 1x/s    │            └─► copied to /var/lib/painel/... (if recording)
-                                                 ▼
-                              PIL ──► /dev/fb0 (framebuffer) ──► HDMI
+ camera(s) ──RTSP/UDP──► ffmpeg (stays connected, keyframes only) ──► /run/painel/CAMn.jpg       (RAM, spares the SD card)
+                                                                │         /run/painel/CAMn.full.jpg  (original resolution)
+                                                                │                  │
+                                           redraws the bar 1x/s │                  └─► copied to /var/lib/painel/... (if recording)
+                                                                ▼
+                                              PIL ──► /dev/fb0 (framebuffer) ──► HDMI
 ```
 
-- One thread captures (one camera at a time, to limit CPU and RAM); the main loop only draws.
+- One thread **per camera** keeps an `ffmpeg` connected. It decodes only keyframes (`-skip_frame nokey`),
+  picks one frame every `PAINEL_PAUSA` seconds without ever repeating a frame (a repeated frame would look
+  "updated now" while being stale) and writes it atomically (`-atomic_writing 1`), so the panel never reads a
+  half-written JPEG.
+- A watchdog restarts the `ffmpeg` if it exits or if no new frame arrives for `max(45, 4 × PAINEL_PAUSA)` s,
+  with a back-off of up to 60 s while the camera is down.
+- The main loop rewrites **only the 48-line top bar** once per second (clock and "updated Ns ago"). The whole
+  screen is rewritten only when the image changes (new frame, camera switch, NO SIGNAL), plus a full refresh
+  every 60 s as a safety net.
+- With several cameras there is one `ffmpeg` per camera; this was only measured with one.
 - The text console is switched to graphics mode (`KD_GRAPHICS`) so it does not draw over the panel.
 - Photo cleanup runs every hour and **does not load the file list into memory**: file names already sort by
   date, so it just walks the folders in order.
+- `--verificar` still does a single one-shot capture per camera.
 
-## Measured performance (Pi 1 Model B)
+## Measured performance (Pi 1 Model B, one camera)
 
 | Item | Value |
 |---|---|
-| Test camera stream | H.264 Main, 1280×720, 15 fps |
-| Time per snapshot | ~8 s (up to ~13 s when the Pi was busy) |
-| `ffmpeg` RAM | peak of ~46 MB |
-| Panel (Python) RAM | ~14 MB |
-| Python CPU | ~27–32 % |
-| Average photo size | ~87 KB (small sample: 68–108 KB) |
+| Test camera stream | H.264, 1280×720, 10 fps (`ffprobe`) |
+| Time to the first frame after (re)start | ~18–24 s (connect + wait for a keyframe) |
+| New frame | every ~12 s (follows the camera's keyframes) |
+| `ffmpeg` CPU (continuous, keyframes only) | ~24 % of one core (90 s test) |
+| Whole service CPU | ~27–29 % of one core (60 s windows); the previous one-capture-per-photo version used ~60 % at `PAINEL_PAUSA=10` |
+| Load average | ~1 (it was ~3.5) |
+| Average photo size | ~200 KB at the original resolution (sample of one frame: 198 KB; older sample of 6,447 photos: ~200 KB) |
+
+RAM was not re-measured for this version. Decoder warnings such as `Too short data for FU-A H.264 RTP packet`
+show up now and then (UDP packet loss); `ffmpeg` keeps going, and a damaged frame may show artifacts.
 
 ## Photo storage
 
-Estimate at ~87 KB per photo (it varies with the scene; at night, with infrared, it may change):
+Estimate at ~200 KB per photo (it varies with the scene; at night, with infrared, it may change). With the test
+camera a photo is saved about every 12 s:
 
-| Interval | Per day | 7 days |
-|---|---|---|
-| 10 s | ~730 MB | ~5 GB |
-| 30 s | ~245 MB | ~1.7 GB |
-| 1 min | ~120 MB | ~0.8 GB |
+| Interval | Photos per day | Per day | 5 days (default) |
+|---|---|---|---|
+| ~12 s (every frame) | ~7,200 | ~1.4 GB | ~7.2 GB |
+| 30 s | 2,880 | ~0.6 GB | ~2.9 GB |
+| 1 min | 1,440 | ~0.3 GB | ~1.4 GB |
 
-On a Pi 1 the real cycle is at least ~10 s (the capture alone takes ~8 s), so actual usage tends to be lower.
+At the default 8 GB cap, 5 days of photos at ~12 s is right at the limit: if it goes over, the oldest photos are
+deleted first. Raise `PAINEL_GRAVAR_INTERVALO` or lower `PAINEL_RETENCAO_DIAS` to keep more margin.
 
 ## Getting the photos
 
@@ -145,8 +167,10 @@ unencrypted. Do not expose the Pi to the internet; for remote access, use a VPN 
   standby and cut the USB port that powers the Pi. Keep the screen on.
 - **Recording to the SD card** writes hundreds of MB per day; a power loss during a write can corrupt files or
   the card. Another reason for a good power supply.
-- **The password appears on `ffmpeg`'s command line** (visible in `ps` to other users on the Pi, for a few
-  seconds per capture). On a personal, single-user Pi the risk is low, but it is good to know.
+- **The password appears on `ffmpeg`'s command line**, and since `ffmpeg` now stays connected it is visible in
+  `ps` to every user on the Pi **all the time**. See "Hiding the password from `ps`" below.
+- **RTSP over `tcp` failed on the test camera** (`Nonmatching transport in server reply`), so the continuous
+  connection also uses UDP. Packet loss shows up as decoder warnings, not as a dropped connection.
 
 ## Security and privacy
 
@@ -155,6 +179,29 @@ unencrypted. Do not expose the Pi to the internet; for remote access, use a VPN 
 - Error messages and the `--verificar` mode mask the password.
 - The photos stay on the SD card: anyone with physical access to it can see the images.
 
+### Hiding the password from `ps` (recommended)
+
+`ffmpeg` only accepts the credentials inside the RTSP URL, so they end up in its arguments. Mounting `/proc`
+with `hidepid=2` makes other users' processes invisible to non-root users. It does **not** protect against
+root, and the password stays on `ffmpeg`'s command line.
+
+```bash
+sudo cp -p /etc/fstab /etc/fstab.bak
+sudo groupadd -r proc                       # users in this group still see every process
+GID=$(getent group proc | cut -d: -f3)
+# systemd-logind must keep seeing all processes:
+sudo mkdir -p /etc/systemd/system/systemd-logind.service.d
+printf '[Service]\nSupplementaryGroups=proc\n' | sudo tee /etc/systemd/system/systemd-logind.service.d/hidepid.conf
+sudo systemctl daemon-reload && sudo systemctl restart systemd-logind
+# persist across reboots, then apply now:
+sudo sed -i -E "s#^proc[[:space:]]+/proc[[:space:]]+proc[[:space:]]+defaults[[:space:]]#proc /proc proc defaults,hidepid=2,gid=$GID #" /etc/fstab
+sudo mount -o remount,hidepid=2,gid=$GID /proc
+```
+
+Tested on Raspberry Pi OS (Debian 12, systemd 252): after it, `ps` as a normal user no longer shows the
+`ffmpeg` of root, and the setting survived a reboot. To undo it:
+`sudo mount -o remount,hidepid=0 /proc`, restore `/etc/fstab` and delete the `hidepid.conf` drop-in.
+
 ## Tests
 
 ```bash
@@ -162,7 +209,10 @@ python3 -m unittest discover -s tests -v
 ```
 
 They cover config parsing (including a password with `$`, `"` and `\`), numeric camera ordering, password
-masking, and photo cleanup by age and by size. They need Pillow (on the Pi: `python3-pil`).
+masking, photo cleanup by age and by size, the continuous `ffmpeg` command (keyframes only, atomic writes,
+URL escaping), the bar-only redraw (the isolated bar is byte-identical to the top of a full frame), and the
+interval between saved photos. They need Pillow (on the Pi: `python3-pil`) and **Linux**, because the script
+imports `fcntl`; on Windows, run them on the Pi.
 
 ## Uninstall
 
